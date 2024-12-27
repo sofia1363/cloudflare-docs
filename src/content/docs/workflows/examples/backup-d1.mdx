@@ -30,14 +30,14 @@ import {
 } from "cloudflare:workers";
 
 
-// We are using Email Routing to send emails out and D1 for our cart database
+// We are using R2 to store the D1 backup
 type Env = {
   BACKUP_WORKFLOW: Workflow;
   D1_REST_API_TOKEN: string;
   BACKUP_BUCKET: R2Bucket;
 };
 
-// Workflow parameters: we expect a cartId
+// Workflow parameters: we expect accountId and databaseId
 type Params = {
   accountId: string;
   databaseId: string;
@@ -46,85 +46,40 @@ type Params = {
 // Workflow logic
 export class backupWorkflow extends WorkflowEntrypoint<Env, Params> {
   async run(event: WorkflowEvent<Params>, step: WorkflowStep) {
-    
+    const { accountId, databaseId } = event.payload;
 
-    // Retrieve the cart from the D1 database
-    // if the cart hasn't been checked out yet retry every 2 minutes, 10 times, otherwise give up
-    const cart = await step.do(
-      "retrieve cart",
-      {
-        retries: {
-          limit: 10,
-          delay: 2000 * 60,
-          backoff: "constant",
-        },
-        timeout: "30 seconds",
-      },
-      async () => {
-        const { results } = await this.env.DB.prepare(
-          `SELECT * FROM cart WHERE id = ?`,
-        )
-          .bind(event.payload.cartId)
-          .all();
-        // should return { checkedOut: true, amount: 250 , account: { email: "celsomartinho@gmail.com" }};
-        if(results[0].checkedOut === false) {
-          throw new Error("cart hasn't been checked out yet");
-        }
-        return results[0];
-      },
-    );
+    const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/d1/database/${databaseId}/export`;
+    const method = "POST";
+    const headers = new Headers();
+    headers.append("Content-Type", "application/json");
+    headers.append("Authorization", `Bearer ${this.env.D1_REST_API_TOKEN}`);
 
-    // Proceed to payment, retry 10 times every minute or give up
-    const payment = await step.do(
-      "payment",
-      {
-        retries: {
-          limit: 10,
-          delay: 1000 * 60,
-          backoff: "constant",
-        },
-        timeout: "30 seconds",
-      },
-      async () => {
-        let resp = await fetch("https://payment-processor.example.com/", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json; charset=utf-8",
-          },
-          body: JSON.stringify({ amount: cart.amount }),
-        });
+    const bookmark = step.do(`Starting backup for ${databaseId}`, async () => {
+      const payload = { output_format: "polling" };
 
-        if (!resp.ok) {
-          throw new Error("payment has failed");
-        }
+      const res = await fetch(url, { method, headers, body: JSON.stringify(payload) });
+      const { result } = (await res.json()) as any;
 
-        return { success: true, amount: cart.amount };
-      },
-    );
+      // If we don't get `at_bookmark` we throw to retry the step
+      if (!result?.at_bookmark) throw new Error("Missing `at_bookmark`");
 
-    // Send invoice to the customer, retry 10 times every 5 minutes or give up
-		// Requires that cart.account.email has previously been validated in Email Routing,
-		// See https://developers.cloudflare.com/email-routing/email-workers/
-    await step.do(
-      "send invoice",
-      {
-        retries: {
-          limit: 10,
-          delay: 5000 * 60,
-          backoff: "constant",
-        },
-        timeout: "30 seconds",
-      },
-      async () => {
-        const message = genEmail(cart.account.email, payment.amount);
-        try {
-          await this.env.SEND_EMAIL.send(message);
-        } catch (e) {
-          throw new Error("failed to send invoice");
-        }
-      },
-    );
+      return result.at_bookmark;
+    });
 
+    step.do("Check backup status and store it on R2", async () => {
+      const payload = { current_bookmark: bookmark };
+
+      const res = await fetch(url, { method, headers, body: JSON.stringify(payload) });
+      const { result } = (await res.json()) as any;
+
+      // The endpoint sends `signed_url` when the backup is ready.
+      // If we don't get `signed_url` we throw to retry the step.
+      if (!result?.signed_url) throw new Error("Missing `signed_url`");
+
+      const dumpResponse = await fetch(result.signed_url);
+      // We stream the file directly to R2
+      await this.env.BACKUP_BUCKET.put(result.filename, dumpResponse.body);
+    });
   }
 }
 
@@ -134,8 +89,8 @@ export default {
   },
     async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
         const params: Params = {
-          accountId: "{account_id}",
-          databaseId: "{database_id},
+          accountId: "{accountId}",
+          databaseId: "{databaseId},
         };
         const instance = await env.BACKUP_WORKFLOW.create({ params });
         console.log(`Started workflow: ${instance.id}`);
@@ -170,6 +125,10 @@ compatibility_flags = ["nodejs_compat" ]
 name = "backup-workflow"
 binding = "BACKUP_WORKFLOW"
 class_name = "backupWorkflow"
+
+[[r2_buckets]]
+binding = "BACKUP_BUCKET"
+bucket_name = "d1-backups"
 
 [triggers]
 crons = [ "0 0 * * *" ]

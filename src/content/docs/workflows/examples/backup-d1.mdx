@@ -1,0 +1,179 @@
+---
+type: example
+summary: Backup D1 using export API
+tags:
+  - Workflows
+  - D1
+pcx_content_type: configuration
+title: Pay cart and send invoice
+sidebar:
+  order: 3
+description: Send invoice when shopping cart is checked out and paid for
+
+---
+
+import { TabItem, Tabs } from "~/components"
+
+In this example, we implement a Workflow for an e-commerce website that is triggered every time a shopping cart is created.
+
+Once a Workflow instance is triggered, it starts polling a [D1](/d1) database for the cart ID until it has been checked out. Once the shopping cart is checked out, we proceed to process the payment with an external provider doing a fetch POST. Finally, assuming everything goes well, we try to send an email using [Email Workers](/email-routing/email-workers/) with the invoice to the customer.
+
+As you can see, Workflows handles all the different service responses and failures; it will retry D1 until the cart is checked out, retry the payment processor if it fails for some reason, and retry sending the email with the invoice if it can't. The developer doesn't have to care about any of that logic, and the workflow can run for hours, handling all the possible conditions until it is completed.
+
+This is a simplified example of processing a shopping cart. We would assume more steps and additional logic in a real-life scenario, but this example gives you a good idea of what you can do with Workflows.
+
+```ts
+import {
+  WorkflowEntrypoint,
+  WorkflowStep,
+  WorkflowEvent,
+} from "cloudflare:workers";
+
+
+// We are using Email Routing to send emails out and D1 for our cart database
+type Env = {
+  BACKUP_WORKFLOW: Workflow;
+  D1_REST_API_TOKEN: string;
+  BACKUP_BUCKET: R2Bucket;
+};
+
+// Workflow parameters: we expect a cartId
+type Params = {
+  accountId: string;
+  databaseId: string;
+};
+
+// Workflow logic
+export class backupWorkflow extends WorkflowEntrypoint<Env, Params> {
+  async run(event: WorkflowEvent<Params>, step: WorkflowStep) {
+    
+
+    // Retrieve the cart from the D1 database
+    // if the cart hasn't been checked out yet retry every 2 minutes, 10 times, otherwise give up
+    const cart = await step.do(
+      "retrieve cart",
+      {
+        retries: {
+          limit: 10,
+          delay: 2000 * 60,
+          backoff: "constant",
+        },
+        timeout: "30 seconds",
+      },
+      async () => {
+        const { results } = await this.env.DB.prepare(
+          `SELECT * FROM cart WHERE id = ?`,
+        )
+          .bind(event.payload.cartId)
+          .all();
+        // should return { checkedOut: true, amount: 250 , account: { email: "celsomartinho@gmail.com" }};
+        if(results[0].checkedOut === false) {
+          throw new Error("cart hasn't been checked out yet");
+        }
+        return results[0];
+      },
+    );
+
+    // Proceed to payment, retry 10 times every minute or give up
+    const payment = await step.do(
+      "payment",
+      {
+        retries: {
+          limit: 10,
+          delay: 1000 * 60,
+          backoff: "constant",
+        },
+        timeout: "30 seconds",
+      },
+      async () => {
+        let resp = await fetch("https://payment-processor.example.com/", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json; charset=utf-8",
+          },
+          body: JSON.stringify({ amount: cart.amount }),
+        });
+
+        if (!resp.ok) {
+          throw new Error("payment has failed");
+        }
+
+        return { success: true, amount: cart.amount };
+      },
+    );
+
+    // Send invoice to the customer, retry 10 times every 5 minutes or give up
+		// Requires that cart.account.email has previously been validated in Email Routing,
+		// See https://developers.cloudflare.com/email-routing/email-workers/
+    await step.do(
+      "send invoice",
+      {
+        retries: {
+          limit: 10,
+          delay: 5000 * 60,
+          backoff: "constant",
+        },
+        timeout: "30 seconds",
+      },
+      async () => {
+        const message = genEmail(cart.account.email, payment.amount);
+        try {
+          await this.env.SEND_EMAIL.send(message);
+        } catch (e) {
+          throw new Error("failed to send invoice");
+        }
+      },
+    );
+
+  }
+}
+
+export default {
+  async fetch(req: Request, env: Env): Promise<Response> {
+    return new Response("Not found", { status: 404 });
+  },
+    async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
+        const params: Params = {
+          accountId: "{account_id}",
+          databaseId: "{database_id},
+        };
+        const instance = await env.BACKUP_WORKFLOW.create({ params });
+        console.log(`Started workflow: ${instance.id}`);
+  },
+};
+```
+
+Here's a minimal package.json:
+
+```json
+{
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241224.0",
+    "wrangler": "^3.99.0"
+  }
+}
+```
+
+And finally wrangler.toml:
+
+import { WranglerConfig } from "~/components";
+
+<WranglerConfig>
+
+```toml
+name = "backup-d1"
+main = "src/index.ts"
+compatibility_date = "2024-12-27"
+compatibility_flags = ["nodejs_compat" ]
+
+[[workflows]]
+name = "backup-workflow"
+binding = "BACKUP_WORKFLOW"
+class_name = "backupWorkflow"
+
+[triggers]
+crons = [ "0 0 * * *" ]
+
+```
+
+</WranglerConfig>
